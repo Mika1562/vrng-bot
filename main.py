@@ -1,17 +1,36 @@
 """
-Главный файл на Render: веб-админка, self-ping, супервизор l6.py.
+Админка Кати. Одна страница / со статусом (ассеты StayPresent) + управление.
+Супервизор l6.py пишет в status_registry.
+UI (title/theme/accent/секции/тексты/футер) читается из conf.yaml на каждый запрос.
 """
 
-import asyncio
-import json
-import logging
+import html as html_escape
 import os
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-import aiohttp
-from aiohttp import web
+import yaml
+from flask import Flask, Response, jsonify, request
+
+from status_registry import (
+    reset as registry_reset,
+    mark_started,
+    mark_clean_exit,
+    mark_crashed,
+    mark_permanently_failed,
+    append_log,
+    update_service_override,
+    snapshot,
+)
+from status_assets import STATUS_CSS, STATUS_HTML_TEMPLATE, STATUS_JS
+
+try:
+    from waitress import serve as waitress_serve
+except ImportError:
+    waitress_serve = None
 
 
 # ============================================================
@@ -19,111 +38,207 @@ from aiohttp import web
 # ============================================================
 PORT = int(os.getenv("PORT", 8080))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
-PING_INTERVAL = 600          # 10 минут
-SUPERVISOR_DELAY = 3         # пауза перед рестартом l6
 PROMPT_FILE = Path("system_prompt.txt")
-STATS_FILE = Path("stats.json")
-START_TIME = time.monotonic()
+CONF_FILE = Path("conf.yaml")
+BOT_FILE = "l6.py"
+BOT_INDEX = 0
+BOT_NAME = "kate-bot"
+BOT_DESCRIPTION = "Discord-бот Катя"
+SUPERVISOR_DELAY = 3.0
+MAX_RESTARTS = 5
+RESTART_RESET_AFTER = 60.0
 
-logging.basicConfig(
-    format="%(asctime)s [main] %(levelname)s: %(message)s",
-    level=logging.INFO,
-    stream=sys.stdout,
-)
-logger = logging.getLogger("main")
+app = Flask(__name__)
+
+_state_lock = threading.Lock()
+current_proc = None
+_stop = threading.Event()
+
+
+# ============================================================
+# UI-КОНФИГ ИЗ YAML
+# ============================================================
+UI_DEFAULTS = {
+    "title": "Катя — админка",
+    "subtitle": "Real-time system status and incident reports",
+    "theme": "dark",
+    "accent_color": "#f63b3b",
+    "sections": {
+        "status": True,
+        "controls": True,
+        "prompt": True,
+        "footer": True,
+    },
+    "labels": {
+        "controls_heading": "⚙️ Управление",
+        "restart_bot": "🔄 Перезапустить бота",
+        "hard_restart": "☠️ Жёсткий рестарт",
+        "prompt_heading": "📝 Системный промпт",
+        "save_prompt": "💾 Сохранить промпт",
+        "prompt_hint": "Файл: system_prompt.txt. Изменения применяются со следующего сообщения.",
+        "login_heading": "🧹 Катя — админка",
+        "login_hint": "Введи ADMIN_TOKEN",
+        "login_button": "Войти",
+    },
+    "footer": {
+        "copyright": "",
+        "links": [],
+    },
+}
+
+
+def _load_ui() -> dict:
+    """Читает conf.yaml на каждый вызов. Битый/отсутствующий — дефолты."""
+    ui = {
+        "sections": dict(UI_DEFAULTS["sections"]),
+        "labels": dict(UI_DEFAULTS["labels"]),
+        "footer": {
+            "copyright": UI_DEFAULTS["footer"]["copyright"],
+            "links": list(UI_DEFAULTS["footer"]["links"]),
+        },
+    }
+    for k in ("title", "subtitle", "theme", "accent_color"):
+        ui[k] = UI_DEFAULTS[k]
+
+    try:
+        with CONF_FILE.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except (FileNotFoundError, yaml.YAMLError) as e:
+        print(f"[ui] conf.yaml не прочитан: {e} — беру дефолты", flush=True)
+        return ui
+
+    src = cfg.get("ui") or {}
+    if not isinstance(src, dict):
+        return ui
+
+    for key in ("title", "subtitle", "theme", "accent_color"):
+        if isinstance(src.get(key), str):
+            ui[key] = src[key]
+
+    if isinstance(src.get("sections"), dict):
+        for k, v in src["sections"].items():
+            if isinstance(v, bool):
+                ui["sections"][k] = v
+
+    if isinstance(src.get("labels"), dict):
+        for k, v in src["labels"].items():
+            if isinstance(v, str):
+                ui["labels"][k] = v
+
+    if isinstance(src.get("footer"), dict):
+        if isinstance(src["footer"].get("copyright"), str):
+            ui["footer"]["copyright"] = src["footer"]["copyright"]
+        if isinstance(src["footer"].get("links"), list):
+            ui["footer"]["links"] = [
+                lk for lk in src["footer"]["links"]
+                if isinstance(lk, dict) and lk.get("label") and lk.get("url")
+            ]
+
+    return ui
+
+
+def _hex_shift(hex_color: str, delta: int) -> str:
+    """Сдвигает hex на delta (может быть отрицательным). Для --primary-dark."""
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return hex_color
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except ValueError:
+        return hex_color
+    r = max(0, min(255, r + delta))
+    g = max(0, min(255, g + delta))
+    b = max(0, min(255, b + delta))
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 # ============================================================
 # СУПЕРВИЗОР l6.py
 # ============================================================
-current_proc: asyncio.subprocess.Process | None = None
-l6_starts = 0
+def _supervise():
+    global current_proc
+    restarts = 0
+    started_at = None
 
-
-async def supervise_l6():
-    global current_proc, l6_starts
-    while True:
-        l6_starts += 1
-        logger.info("Запускаю l6.py (попытка #%s)", l6_starts)
+    while not _stop.is_set():
         try:
-            current_proc = await asyncio.create_subprocess_exec(
-                sys.executable, "l6.py",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            proc = subprocess.Popen(
+                [sys.executable, BOT_FILE],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
-            async for raw in current_proc.stdout:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                if line:
-                    logger.info("[l6] %s", line)
-            code = await current_proc.wait()
-            logger.warning("l6.py завершился с кодом %s", code)
-        except Exception as e:
-            logger.exception("Ошибка супервизора: %s", e)
-        current_proc = None
-        await asyncio.sleep(SUPERVISOR_DELAY)
+        except OSError as e:
+            print(f"[supervisor] не смог запустить {BOT_FILE}: {e}", flush=True)
+            mark_permanently_failed(BOT_INDEX, 1)
+            return
 
+        with _state_lock:
+            current_proc = proc
+        started_at = time.monotonic()
+        mark_started(BOT_INDEX)
+        print(f"[supervisor] {BOT_FILE} запущен (PID {proc.pid})", flush=True)
 
-async def restart_l6():
-    if current_proc and current_proc.returncode is None:
-        logger.info("Убиваю l6.py по запросу из админки")
-        current_proc.terminate()
         try:
-            await asyncio.wait_for(current_proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            current_proc.kill()
-    # супервизор сам поднимет новый
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip("\n")
+                print(f"[l6] {line}", flush=True)
+                append_log(BOT_INDEX, "stdout", line)
+        except Exception as e:
+            print(f"[supervisor] ошибка чтения stdout: {e}", flush=True)
+
+        proc.wait()
+        with _state_lock:
+            current_proc = None
+
+        if _stop.is_set():
+            return
+
+        code = proc.returncode
+        uptime = time.monotonic() - (started_at or time.monotonic())
+
+        if code == 0:
+            print("[supervisor] l6 завершился штатно", flush=True)
+            mark_clean_exit(BOT_INDEX)
+            return
+
+        if uptime >= RESTART_RESET_AFTER and restarts > 0:
+            print(f"[supervisor] uptime {uptime:.0f}s — сбрасываю счётчик", flush=True)
+            restarts = 0
+
+        if restarts >= MAX_RESTARTS:
+            print(f"[supervisor] лимит рестартов ({MAX_RESTARTS})", flush=True)
+            mark_permanently_failed(BOT_INDEX, code)
+            return
+
+        restarts += 1
+        print(f"[supervisor] l6 упал (код {code}), рестарт {restarts}/{MAX_RESTARTS}", flush=True)
+        mark_crashed(BOT_INDEX, code, will_restart=True)
+
+        if _stop.wait(timeout=SUPERVISOR_DELAY):
+            return
 
 
-# ============================================================
-# SELF-PING
-# ============================================================
-async def self_ping():
-    if not SELF_URL:
-        logger.warning("RENDER_EXTERNAL_URL не задан — self-ping отключён")
-        return
-    url = SELF_URL.rstrip("/") + "/health"
-    logger.info("Self-ping стартовал: %s каждые %ss", url, PING_INTERVAL)
-    async with aiohttp.ClientSession() as s:
-        while True:
-            await asyncio.sleep(PING_INTERVAL)
-            try:
-                async with s.get(url, timeout=15) as r:
-                    logger.info("self-ping → %s", r.status)
-            except Exception as e:
-                logger.warning("self-ping упал: %s", e)
-
-
-# ============================================================
-# РАБОТА С ФАЙЛАМИ
-# ============================================================
-def load_prompt() -> str:
-    try:
-        return PROMPT_FILE.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
-
-
-def save_prompt(text: str) -> None:
-    PROMPT_FILE.write_text(text, encoding="utf-8")
-
-
-def load_stats() -> dict:
-    try:
-        return json.loads(STATS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def _restart_bot():
+    with _state_lock:
+        proc = current_proc
+    if proc is not None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
 
 
 # ============================================================
 # АВТОРИЗАЦИЯ
 # ============================================================
-def check_token(request: web.Request) -> bool:
+def _check_token() -> bool:
     if not ADMIN_TOKEN:
         return False
     if request.cookies.get("admin_token") == ADMIN_TOKEN:
         return True
-    if request.query.get("token") == ADMIN_TOKEN:
+    if request.args.get("token") == ADMIN_TOKEN:
         return True
     return False
 
@@ -131,172 +246,282 @@ def check_token(request: web.Request) -> bool:
 # ============================================================
 # HTML
 # ============================================================
-def page(body: str) -> str:
-    return f"""<!DOCTYPE html><html lang="ru"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Катя — админка</title>
+def _read_prompt() -> str:
+    try:
+        return PROMPT_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def _build_admin_html() -> str:
+    ui = _load_ui()
+    l = ui["labels"]
+    sections = ui["sections"]
+
+    prompt_value = _read_prompt()
+    prompt_escaped = (
+        html_escape.escape(prompt_value)
+        if prompt_value
+        else "— пусто, бот использует встроенный дефолт —"
+    )
+
+    # --- Блок управления ---
+    parts = []
+    if sections.get("controls"):
+        parts.append(f"""
+        <h2 style="font-size:1.5em;margin-bottom:20px;font-weight:700;">{html_escape.escape(l['controls_heading'])}</h2>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:30px;">
+          <button type="button" onclick="if(confirm('Перезапустить {BOT_FILE}?'))adminPost('/restart-bot')"
+                  style="padding:10px 20px;border-radius:8px;border:none;background:var(--primary-color);color:white;cursor:pointer;font-weight:600;">
+            {html_escape.escape(l['restart_bot'])}
+          </button>
+          <button type="button" onclick="if(confirm('Жёсткий рестарт? Render поднимет заново.'))adminPost('/restart-all')"
+                  style="padding:10px 20px;border-radius:8px;border:none;background:var(--danger-color);color:white;cursor:pointer;font-weight:600;">
+            {html_escape.escape(l['hard_restart'])}
+          </button>
+        </div>
+        """)
+
+    if sections.get("prompt"):
+        parts.append(f"""
+        <h2 style="font-size:1.2em;margin-bottom:12px;font-weight:600;">{html_escape.escape(l['prompt_heading'])}</h2>
+        <form method="POST" action="/prompt">
+          <textarea name="prompt"
+                    style="width:100%;min-height:260px;padding:16px;border:1px solid var(--border-color);border-radius:10px;background:var(--white);color:var(--dark);font-family:'SFMono-Regular',Consolas,monospace;font-size:0.9em;line-height:1.5;resize:vertical;">{prompt_escaped}</textarea>
+          <div style="margin-top:12px;">
+            <button type="submit"
+                    style="padding:10px 20px;border-radius:8px;border:none;background:var(--primary-color);color:white;cursor:pointer;font-weight:600;">
+              {html_escape.escape(l['save_prompt'])}
+            </button>
+          </div>
+        </form>
+        <p style="color:var(--gray);font-size:0.85em;margin-top:8px;">
+          {html_escape.escape(l['prompt_hint'])}
+        </p>
+        """)
+
+    admin_section = ""
+    if parts:
+        admin_section = (
+            '<section class="admin-section" '
+            'style="margin-top:50px;padding-top:30px;border-top:2px solid var(--border-color);">'
+            + "".join(parts)
+            + '<script>async function adminPost(url){const r=await fetch(url,{method:"POST"});'
+              'const j=await r.json();alert(JSON.stringify(j));}</script>'
+            + "</section>"
+        )
+
+    # --- Сборка из шаблона StayPresent ---
+    html = STATUS_HTML_TEMPLATE
+
+    # Цвет/тема
+    accent = ui["accent_color"]
+    accent_dark = _hex_shift(accent, -16)
+
+    theme = ui["theme"] if ui["theme"] in ("dark", "light", "auto") else "dark"
+    theme_attr = "" if theme == "auto" else f' data-theme="{theme}"'
+    color_scheme = "light dark" if theme == "auto" else theme
+
+    override_css = f":root {{ --primary-color: {accent}; --primary-dark: {accent_dark}; }}"
+
+    html = html.replace(
+        '<link rel="stylesheet" href="__STAYPRESENT_CSS_URL__" />',
+        f"<style>{STATUS_CSS}</style><style>{override_css}</style>",
+    )
+    html = html.replace(
+        '<script src="__STAYPRESENT_JS_URL__"></script>',
+        f"<script>{STATUS_JS}</script>",
+    )
+    html = html.replace(
+        '<link rel="icon" href="__STAYPRESENT_FAVICON_URL__" id="favicon">',
+        '<link rel="icon" href="data:," id="favicon">',
+    )
+
+    html = html.replace("__STAYPRESENT_TITLE__", html_escape.escape(ui["title"]))
+    html = html.replace("__STAYPRESENT_DESCRIPTION__", html_escape.escape(ui["subtitle"]))
+    html = html.replace("__STAYPRESENT_COLOR_SCHEME__", color_scheme)
+    html = html.replace("__STAYPRESENT_THEME_ATTR__", theme_attr)
+    html = html.replace("__STAYPRESENT_OG_TAGS_BLOCK__", "")
+    html = html.replace("__STAYPRESENT_FAVICON_SCRIPT__", "")
+
+    # Футер
+    if sections.get("footer"):
+        copyright_text = (ui["footer"].get("copyright") or "").strip()
+        copyright_block = f'<p>{html_escape.escape(copyright_text)}</p>' if copyright_text else ""
+        links = ui["footer"].get("links") or []
+        if links:
+            link_html = " | ".join(
+                f'<a href="{html_escape.escape(lk["url"], quote=True)}">'
+                f'{html_escape.escape(lk["label"])}</a>'
+                for lk in links
+            )
+            links_block = f'<div class="footer-links">{link_html}</div>'
+        else:
+            links_block = ""
+    else:
+        copyright_block = ""
+        links_block = ""
+        html = html.replace('<div class="powered-by">', '<div class="powered-by" hidden>')
+
+    html = html.replace("__STAYPRESENT_COPYRIGHT_BLOCK__", copyright_block)
+    html = html.replace("__STAYPRESENT_FOOTER_LINKS_BLOCK__", links_block)
+
+    # Скрыть статус-панель целиком, если выключена
+    if not sections.get("status"):
+        hide_css = (
+            "<style>"
+            "body > .container > header,"
+            "body > .container > .status-summary,"
+            "body > .container > .services,"
+            "body > .container > .incidents,"
+            "body > .container > .metrics"
+            "{display:none !important;}"
+            "</style>"
+        )
+        html = html.replace("</head>", hide_css + "</head>")
+
+    # Наш блок управления — перед <footer>
+    if admin_section:
+        html = html.replace("      <footer>", admin_section + "\n      <footer>", 1)
+
+    return html
+
+
+def _login_page(err: str = "") -> str:
+    ui = _load_ui()
+    l = ui["labels"]
+    accent = ui["accent_color"]
+    theme = ui["theme"] if ui["theme"] in ("dark", "light", "auto") else "dark"
+
+    if theme == "light":
+        bg, card, line, text, muted, input_bg = "#f8fafc", "#ffffff", "#e2e8f0", "#0f172a", "#64748b", "#f1f5f9"
+    elif theme == "dark":
+        bg, card, line, text, muted, input_bg = "#0b1220", "#16202f", "#2d3b4e", "#e6edf3", "#94a3b8", "#0b1220"
+    else:  # auto
+        bg, card, line, text, muted, input_bg = "#0b1220", "#16202f", "#2d3b4e", "#e6edf3", "#94a3b8", "#0b1220"
+
+    e = f'<p style="color:#f87171;margin:0 0 1rem">{html_escape.escape(err)}</p>' if err else ""
+
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html_escape.escape(ui['title'])}</title>
 <style>
- body{{background:#0f172a;color:#e2e8f0;font-family:-apple-system,sans-serif;
-      max-width:1000px;margin:2rem auto;padding:0 1rem}}
- h1{{color:#4ade80}} h2{{color:#60a5fa;margin-top:2rem}}
- textarea{{width:100%;height:40vh;background:#1e293b;color:#e2e8f0;
-          border:1px solid #334155;border-radius:8px;padding:1rem;
-          font-family:monospace;font-size:.9rem}}
- button{{background:#2563eb;color:#fff;border:none;padding:.6rem 1.4rem;
-        border-radius:6px;cursor:pointer;font-size:1rem;margin-right:.5rem}}
- button:hover{{background:#1d4ed8}}
- button.danger{{background:#b91c1c}} button.danger:hover{{background:#991b1b}}
- .msg{{padding:.6rem 1rem;border-radius:6px;margin:.8rem 0}}
- .ok{{background:#064e3b;color:#d1fae5}} .err{{background:#7f1d1d;color:#fee2e2}}
- .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.7rem}}
- .stat{{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:.8rem}}
- .stat .v{{font-size:1.4rem;color:#4ade80;font-weight:600}}
- .stat .k{{font-size:.75rem;color:#94a3b8;text-transform:uppercase}}
- .hint{{color:#94a3b8;font-size:.85rem;margin-top:.5rem}}
-</style></head><body>{body}
-<script>
-async function refresh(){{
-  try{{
-    const r=await fetch('/stats');const d=await r.json();
-    for(const [k,v] of Object.entries(d.stats||{{}})){{
-      const el=document.getElementById('s-'+k);
-      if(el)el.textContent=v;
-    }}
-    const u=document.getElementById('s-uptime');
-    if(u&&d.uptime!=null){{
-      const s=Math.floor(d.uptime);const h=Math.floor(s/3600);
-      const m=Math.floor((s%3600)/60);u.textContent=h+'ч '+m+'м '+(s%60)+'с';
-    }}
-    const p=document.getElementById('s-proc');
-    if(p)p.textContent=d.l6_alive?'жив':'мёртв';
-  }}catch(e){{}}
-}}
-setInterval(refresh,5000);refresh();
-async function post(url,body){{
-  const r=await fetch(url,{{method:'POST',headers:{{'Content-Type':'application/json'}},
-                            body:JSON.stringify(body||{{}})}});
-  const j=await r.json(); alert(JSON.stringify(j)); refresh();
-}}
-</script></body></html>"""
-
-
-def login_page(err: str = "") -> str:
-    e = f'<div class="msg err">{err}</div>' if err else ""
-    return page(f"""<h1>Вход в админку Кати</h1>{e}
-<form method="POST" action="/login">
- <input type="password" name="token" placeholder="ADMIN_TOKEN"
-  style="width:100%;padding:.7rem;background:#1e293b;color:#e2e8f0;
-         border:1px solid #334155;border-radius:6px">
- <button type="submit" style="margin-top:.8rem">Войти</button>
-</form>""")
-
-
-def admin_page(msg: str = "") -> str:
-    m = f'<div class="msg ok">{msg}</div>' if msg else ""
-    stats = load_stats()
-    return page(f"""
-<h1>🧹 Катя — админка</h1>
-{m}
-
-<h2>Статистика</h2>
-<div class="grid">
-  <div class="stat"><div class="k">Uptime</div><div class="v" id="s-uptime">—</div></div>
-  <div class="stat"><div class="k">l6.py</div><div class="v" id="s-proc">—</div></div>
-  <div class="stat"><div class="k">Сообщений</div><div class="v" id="s-messages">{stats.get('messages', 0)}</div></div>
-  <div class="stat"><div class="k">Успешных LLM</div><div class="v" id="s-llm_ok">{stats.get('llm_ok', 0)}</div></div>
-  <div class="stat"><div class="k">Ошибок LLM</div><div class="v" id="s-llm_err">{stats.get('llm_err', 0)}</div></div>
-  <div class="stat"><div class="k">Запусков l6</div><div class="v" id="s-l6_starts">{l6_starts}</div></div>
+  body{{background:{bg};color:{text};font-family:-apple-system,sans-serif;
+        display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;}}
+  .box{{background:{card};padding:2rem;border-radius:12px;border:1px solid {line};width:360px;}}
+  h1{{color:{accent};margin:0 0 0.5rem;font-size:1.4rem;}}
+  p{{color:{muted};margin:0 0 1rem;font-size:.9rem;}}
+  input{{width:100%;padding:10px 14px;margin:0 0 1rem;border:1px solid {line};border-radius:8px;
+         background:{input_bg};color:{text};box-sizing:border-box;font-size:1rem;}}
+  button{{width:100%;padding:10px;background:{accent};color:white;border:none;border-radius:8px;
+          cursor:pointer;font-weight:600;font-size:1rem;}}
+  button:hover{{opacity:.9;}}
+</style></head><body>
+<div class="box">
+  <h1>{html_escape.escape(l['login_heading'])}</h1>
+  <p>{html_escape.escape(l['login_hint'])}</p>
+  {e}
+  <form method="POST" action="/login">
+    <input type="password" name="token" placeholder="ADMIN_TOKEN" autocomplete="off">
+    <button type="submit">{html_escape.escape(l['login_button'])}</button>
+  </form>
 </div>
-
-<h2>Управление</h2>
-<button onclick="if(confirm('Перезапустить l6.py?'))post('/restart-bot')">Перезапустить бота</button>
-<button class="danger" onclick="if(confirm('Жёсткий рестарт всего процесса? Render поднимет заново, ~10 сек даунтайма.'))post('/restart-all')">Жёсткий рестарт</button>
-
-<h2>Системный промпт</h2>
-<form method="POST" action="/prompt">
-  <textarea name="prompt">{load_prompt() or '— пусто, бот использует встроенный дефолт —'}</textarea>
-  <button type="submit" style="margin-top:.8rem">Сохранить</button>
-</form>
-<p class="hint">Файл: system_prompt.txt. Изменения применяются со следующего сообщения.</p>
-""")
+</body></html>"""
 
 
 # ============================================================
 # РОУТЫ
 # ============================================================
-async def h_health(_): return web.json_response({"status": "ok"})
+@app.route("/")
+def index():
+    if not ADMIN_TOKEN:
+        return Response(
+            "<h1 style='font-family:sans-serif;text-align:center;margin-top:4rem'>"
+            "ADMIN_TOKEN не задан в env</h1>",
+            status=503,
+        )
+    if not _check_token():
+        return Response(_login_page(), mimetype="text/html")
+    return Response(_build_admin_html(), mimetype="text/html")
 
-async def h_stats(_):
-    return web.json_response({
-        "uptime": time.monotonic() - START_TIME,
-        "l6_alive": current_proc is not None and current_proc.returncode is None,
-        "l6_starts": l6_starts,
-        "stats": load_stats(),
-    })
 
-async def h_login_post(req):
-    data = await req.post()
-    if data.get("token") == ADMIN_TOKEN:
-        resp = web.HTTPFound("/")
+@app.route("/login", methods=["POST"])
+def login():
+    token = (request.form.get("token") or "").strip()
+    if token == ADMIN_TOKEN:
+        resp = Response(status=302)
+        resp.headers["Location"] = "/"
         resp.set_cookie("admin_token", ADMIN_TOKEN, httponly=True, samesite="Strict")
         return resp
-    return web.Response(text=login_page("Неверный токен"), content_type="text/html")
+    return Response(_login_page("Неверный токен"), status=403, mimetype="text/html")
 
-async def h_index(req):
-    if not ADMIN_TOKEN:
-        return web.Response(text=page("<h1>ADMIN_TOKEN не задан в env</h1>"), content_type="text/html")
-    if not check_token(req):
-        return web.Response(text=login_page(), content_type="text/html")
-    return web.Response(text=admin_page(), content_type="text/html")
 
-async def h_prompt(req):
-    if not check_token(req):
-        return web.Response(status=403, text="forbidden")
-    data = await req.post()
-    text = (data.get("prompt") or "").strip()
-    if text and text != "— пусто, бот использует встроенный дефолт —":
-        save_prompt(text)
-        return web.HTTPFound("/")
-    return web.HTTPFound("/")
+@app.route("/api/status.json")
+def api_status_json():
+    ui = _load_ui()
+    timezone = "auto"
+    time_format = "24h"
+    try:
+        with CONF_FILE.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        ui_cfg = cfg.get("ui") or {}
+        if isinstance(ui_cfg, dict):
+            if isinstance(ui_cfg.get("timezone"), str):
+                timezone = ui_cfg["timezone"]
+            if isinstance(ui_cfg.get("time_format"), str):
+                time_format = ui_cfg["time_format"]
+    except (FileNotFoundError, yaml.YAMLError):
+        pass
 
-async def h_restart_bot(req):
-    if not check_token(req):
-        return web.json_response({"error": "forbidden"}, status=403)
-    asyncio.create_task(restart_l6())
-    return web.json_response({"status": "restarting l6"})
+    data = snapshot(admin=True, timezone=timezone, time_format=time_format)
+    data["admin_available"] = False
+    data["poll_seconds"] = 10
+    return jsonify(data)
 
-async def h_restart_all(req):
-    if not check_token(req):
-        return web.json_response({"error": "forbidden"}, status=403)
-    logger.warning("Жёсткий рестарт по запросу из админки")
-    asyncio.get_event_loop().call_later(1, lambda: os._exit(0))
-    return web.json_response({"status": "dying"})
+
+@app.route("/prompt", methods=["POST"])
+def save_prompt():
+    if not _check_token():
+        return Response("forbidden", status=403)
+    text = (request.form.get("prompt") or "").strip()
+    if text and not text.startswith("—"):
+        PROMPT_FILE.write_text(text, encoding="utf-8")
+    return Response(status=302, headers={"Location": "/"})
+
+
+@app.route("/restart-bot", methods=["POST"])
+def restart_bot_route():
+    if not _check_token():
+        return jsonify({"error": "forbidden"}), 403
+    _restart_bot()
+    return jsonify({"status": "restarting l6"})
+
+
+@app.route("/restart-all", methods=["POST"])
+def restart_all_route():
+    if not _check_token():
+        return jsonify({"error": "forbidden"}), 403
+    threading.Timer(1.0, lambda: os._exit(0)).start()
+    return jsonify({"status": "dying"})
 
 
 # ============================================================
 # ЗАПУСК
 # ============================================================
-async def main():
-    app = web.Application()
-    app.router.add_get("/", h_index)
-    app.router.add_post("/login", h_login_post)
-    app.router.add_post("/prompt", h_prompt)
-    app.router.add_post("/restart-bot", h_restart_bot)
-    app.router.add_post("/restart-all", h_restart_all)
-    app.router.add_get("/stats", h_stats)
-    app.router.add_get("/health", h_health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info("Веб-сервер на порту %s", PORT)
-
-    asyncio.create_task(supervise_l6())
-    asyncio.create_task(self_ping())
-
-    await asyncio.Event().wait()   # вечно
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    registry_reset(
+        [{"file": BOT_FILE, "module": None, "args": [], "env": {}, "status": None}],
+        display_names=[BOT_NAME],
+        track_web_server=False,
+        bot_status=[True],
+    )
+    update_service_override(BOT_FILE, BOT_NAME, BOT_DESCRIPTION)
+
+    threading.Thread(target=_supervise, daemon=True).start()
+
+    if waitress_serve is not None:
+        print(f"[main] waitress на порту {PORT}", flush=True)
+        waitress_serve(app, host="0.0.0.0", port=PORT, threads=4)
+    else:
+        print(f"[main] flask dev-server на порту {PORT}", flush=True)
+        app.run(host="0.0.0.0", port=PORT, threaded=True)

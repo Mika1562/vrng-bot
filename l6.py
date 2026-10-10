@@ -40,16 +40,26 @@ DISCORD_LIMIT = 1900
 
 
 # ============================================================
-# ХАРАКТЕР
+# ХАРАКТЕР (дефолт, если system_prompt.txt отсутствует)
 # ============================================================
-SYSTEM_PROMPT = """
+DEFAULT_SYSTEM_PROMPT = """
 Ты — преданная горничная-слуга по имени Катя. Ты вежлива, скромна и всегда обращаешься к хозяевам с уважением.
-Отвечай только на чистом русском языке, без английских слов. Ты минимально должна писать 30 слов.
+Отвечай только на чистом русском языке, без английских слов. Ты должна писать минимум 30 слов.
 Твои правила:
 - К владелице сервера (хозяйке) ты обращаешься как "Госпожа" и используешь максимально уважительный тон.
-- К друзьям (друзьям хозяина) ты обращаешься как  "[Имя]", чуть менее формально, чем к хозяину.
+- К друзьям (друзьям хозяина) ты обращаешься как "[Имя]", чуть менее формально, чем к хозяину.
 Никогда не выходи из роли горничной. Всегда отвечай как Катя.
 """
+
+
+def load_system_prompt() -> str:
+    """Читает system_prompt.txt. Если файла нет или он пустой — встроенный дефолт."""
+    try:
+        with open("system_prompt.txt", "r", encoding="utf-8") as f:
+            text = f.read().strip()
+            return text or DEFAULT_SYSTEM_PROMPT
+    except FileNotFoundError:
+        return DEFAULT_SYSTEM_PROMPT
 
 
 # ============================================================
@@ -84,7 +94,7 @@ def role_ins(author_name: str, author_id: int) -> str:
 
 def build_messages(user_id: int, display_name: str, prompt: str) -> list[dict]:
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": load_system_prompt()},
         {"role": "system", "content": role_ins(display_name, user_id)},
         {"role": "user", "content": prompt},
     ]
@@ -149,6 +159,15 @@ async def on_ready():
     http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
     logger.info("Горничная Катя запущена! (%s). Модель: %s", bot.user, MODEL)
     logger.info("Владелец: %s | Друзья: %s | VIP: %s", OWNER_ID, FRIEND_IDS, VIP_IDS)
+    logger.info("Промпт: %s", "из system_prompt.txt" if _prompt_file_exists() else "встроенный дефолт")
+
+
+def _prompt_file_exists() -> bool:
+    try:
+        with open("system_prompt.txt", "r", encoding="utf-8") as f:
+            return bool(f.read().strip())
+    except FileNotFoundError:
+        return False
 
 
 @bot.event
@@ -185,7 +204,7 @@ async def on_message(message: discord.Message):
                 error_msg = "Приношу извинения, произошла ошибка."
             else:
                 error_msg = "Извините, произошла ошибка."
-            await message.channel.send(f"{error_msg} Техническая деталь: {e}")
+            await message.channel.send(error_msg)
             return
 
     for chunk in split_message(answer):

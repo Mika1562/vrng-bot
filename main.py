@@ -6,7 +6,7 @@ from flask import request, jsonify
 from bot_logic import build_messages, ask_openrouter, get_user_status
 
 # Flask-приложение, которое обслуживает staypresent
-app = staypresent.web.app
+app = Flask(_main_)
 
 @app.route("/api/playground", methods=["POST"])
 def api_playground():

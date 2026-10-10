@@ -3,7 +3,8 @@
 Супервизор l6.py пишет в status_registry.
 UI (title/theme/accent/секции/тексты/футер) читается из conf.yaml на каждый запрос.
 """
-
+import urllib.request
+import urllib.error
 import html as html_escape
 import os
 import subprocess
@@ -459,6 +460,10 @@ def _login_page(err: str = "") -> str:
 # ============================================================
 # РОУТЫ
 # ============================================================
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
 @app.route("/")
 def index():
     if not ADMIN_TOKEN:

@@ -155,6 +155,33 @@ def _hex_shift(hex_color: str, delta: int) -> str:
 # ============================================================
 # СУПЕРВИЗОР l6.py
 # ============================================================
+# ============================================================
+# SELF-PING (чтобы Render не усыплял сервис)
+# ============================================================
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
+PING_INTERVAL = 600  # 10 минут
+
+
+def _self_ping():
+    if not SELF_URL:
+        print("[ping] RENDER_EXTERNAL_URL/SELF_URL не задан — self-ping выключен", flush=True)
+        return
+
+    url = SELF_URL.rstrip("/") + "/health"
+    print(f"[ping] старт: {url} каждые {PING_INTERVAL}s", flush=True)
+
+    while not _stop.is_set():
+        if _stop.wait(timeout=PING_INTERVAL):
+            return
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "kate-self-ping"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                print(f"[ping] {url} → {resp.status}", flush=True)
+        except urllib.error.HTTPError as e:
+            print(f"[ping] {url} → HTTP {e.code}", flush=True)
+        except Exception as e:
+            print(f"[ping] {url} → ошибка: {e}", flush=True)
+
 def _supervise():
     global current_proc
     restarts = 0

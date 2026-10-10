@@ -136,8 +136,6 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author == bot.user:
-        return
 
     if message.content.startswith("!"):
         await bot.process_commands(message)

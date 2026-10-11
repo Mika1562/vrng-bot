@@ -550,7 +550,8 @@ if __name__ == "__main__":
     update_service_override(BOT_FILE, BOT_NAME, BOT_DESCRIPTION)
 
     threading.Thread(target=_supervise, daemon=True).start()
-
+    threading.Thread(target=_supervise, daemon=True).start()
+    
     if waitress_serve is not None:
         print(f"[main] waitress на порту {PORT}", flush=True)
         waitress_serve(app, host="0.0.0.0", port=PORT, threads=4)

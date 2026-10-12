@@ -88,8 +88,7 @@ def role_ins(author_name: str, author_id: int) -> str:
                 "Обращайся к нему особенно предупредительно и почтительно, "
                 "но без фамильярности.")
     else:
-        return (f"Этот пользователь {author_name} — ПОСТОРОННИЙ. "
-                "Обращайся формально, холодно, без энтузиазма.")
+        return (f"Пользователя зовут - {author_name} ")
 
 
 def build_messages(user_id: int, display_name: str, prompt: str) -> list[dict]:

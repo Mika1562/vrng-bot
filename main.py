@@ -2,11 +2,14 @@
 Админка Кати. Одна страница / со статусом (ассеты StayPresent) + управление.
 Супервизор l6.py пишет в status_registry.
 UI (title/theme/accent/секции/тексты/футер) читается из conf.yaml на каждый запрос.
+Роли — из env-переменных ADMIN_TOKEN_OWNER/ADMIN_TOKEN_ADMIN/ADMIN_TOKEN_JUNIOR.
 """
+
 import urllib.request
 import urllib.error
 import html as html_escape
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -38,7 +41,6 @@ except ImportError:
 # НАСТРОЙКИ
 # ============================================================
 PORT = int(os.getenv("PORT", 8080))
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 PROMPT_FILE = Path("system_prompt.txt")
 CONF_FILE = Path("conf.yaml")
 BOT_FILE = "l6.py"
@@ -49,11 +51,59 @@ SUPERVISOR_DELAY = 3.0
 MAX_RESTARTS = 5
 RESTART_RESET_AFTER = 60.0
 
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
+PING_INTERVAL = 600  # 10 минут
+
 app = Flask(__name__)
 
 _state_lock = threading.Lock()
 current_proc = None
 _stop = threading.Event()
+_supervisor_lock = threading.Lock()
+
+
+# ============================================================
+# РОЛИ И ПРАВА (из env)
+# ============================================================
+ROLE_PERMISSIONS = {
+    "owner": frozenset({"view", "prompt", "restart_bot", "restart_all"}),
+    "admin": frozenset({"view", "prompt", "restart_bot"}),
+    "junior": frozenset({"view"}),
+}
+
+ENV_TO_ROLE = {
+    "ADMIN_TOKEN_OWNER": "owner",
+    "ADMIN_TOKEN_ADMIN": "admin",
+    "ADMIN_TOKEN_JUNIOR": "junior",
+    "ADMIN_TOKEN": "owner",  # обратная совместимость со старой переменной
+}
+
+
+def _load_admins() -> dict:
+    """{token: role}. Читает env на каждый вызов. Пустые пропускает."""
+    result = {}
+    for env_name, role in ENV_TO_ROLE.items():
+        token = (os.getenv(env_name) or "").strip()
+        if not token:
+            continue
+        if token in result:
+            continue  # тот же токен уже привязан — не перезаписываем
+        result[token] = role
+    return result
+
+
+def _get_role() -> str | None:
+    token = request.cookies.get("admin_token") or request.args.get("token")
+    if not token:
+        return None
+    return _load_admins().get(token)
+
+
+def _has_perm(perm: str) -> bool:
+    role = _get_role()
+    if not role:
+        return False
+    return perm in ROLE_PERMISSIONS.get(role, frozenset())
 
 
 # ============================================================
@@ -78,7 +128,7 @@ UI_DEFAULTS = {
         "save_prompt": "💾 Сохранить промпт",
         "prompt_hint": "Файл: system_prompt.txt. Изменения применяются со следующего сообщения.",
         "login_heading": "🧹 Катя — админка",
-        "login_hint": "Введи ADMIN_TOKEN",
+        "login_hint": "Введи токен доступа",
         "login_button": "Войти",
     },
     "footer": {
@@ -154,15 +204,8 @@ def _hex_shift(hex_color: str, delta: int) -> str:
 
 
 # ============================================================
-# СУПЕРВИЗОР l6.py
+# SELF-PING
 # ============================================================
-# ============================================================
-# SELF-PING (чтобы Render не усыплял сервис)
-# ============================================================
-SELF_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SELF_URL")
-PING_INTERVAL = 600  # 10 минут
-
-
 def _self_ping():
     if not SELF_URL:
         print("[ping] RENDER_EXTERNAL_URL/SELF_URL не задан — self-ping выключен", flush=True)
@@ -183,69 +226,81 @@ def _self_ping():
         except Exception as e:
             print(f"[ping] {url} → ошибка: {e}", flush=True)
 
+
+# ============================================================
+# СУПЕРВИЗОР l6.py
+# ============================================================
 def _supervise():
     global current_proc
-    restarts = 0
-    started_at = None
 
-    while not _stop.is_set():
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, BOT_FILE],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except OSError as e:
-            print(f"[supervisor] не смог запустить {BOT_FILE}: {e}", flush=True)
-            mark_permanently_failed(BOT_INDEX, 1)
-            return
+    if not _supervisor_lock.acquire(blocking=False):
+        print("[supervisor] уже запущен, второй поток не стартую", flush=True)
+        return
 
-        with _state_lock:
-            current_proc = proc
-        started_at = time.monotonic()
-        mark_started(BOT_INDEX)
-        print(f"[supervisor] {BOT_FILE} запущен (PID {proc.pid})", flush=True)
+    try:
+        restarts = 0
+        started_at = None
 
-        try:
-            for line in iter(proc.stdout.readline, ""):
-                line = line.rstrip("\n")
-                print(f"[l6] {line}", flush=True)
-                append_log(BOT_INDEX, "stdout", line)
-        except Exception as e:
-            print(f"[supervisor] ошибка чтения stdout: {e}", flush=True)
+        while not _stop.is_set():
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, BOT_FILE],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError as e:
+                print(f"[supervisor] не смог запустить {BOT_FILE}: {e}", flush=True)
+                mark_permanently_failed(BOT_INDEX, 1)
+                return
 
-        proc.wait()
-        with _state_lock:
-            current_proc = None
+            with _state_lock:
+                current_proc = proc
+            started_at = time.monotonic()
+            mark_started(BOT_INDEX)
+            print(f"[supervisor] {BOT_FILE} запущен (PID {proc.pid})", flush=True)
 
-        if _stop.is_set():
-            return
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    line = line.rstrip("\n")
+                    print(f"[l6] {line}", flush=True)
+                    append_log(BOT_INDEX, "stdout", line)
+            except Exception as e:
+                print(f"[supervisor] ошибка чтения stdout: {e}", flush=True)
 
-        code = proc.returncode
-        uptime = time.monotonic() - (started_at or time.monotonic())
+            proc.wait()
+            with _state_lock:
+                current_proc = None
 
-        if code == 0:
-            print("[supervisor] l6 завершился штатно", flush=True)
-            mark_clean_exit(BOT_INDEX)
-            return
+            if _stop.is_set():
+                return
 
-        if uptime >= RESTART_RESET_AFTER and restarts > 0:
-            print(f"[supervisor] uptime {uptime:.0f}s — сбрасываю счётчик", flush=True)
-            restarts = 0
+            code = proc.returncode
+            uptime = time.monotonic() - (started_at or time.monotonic())
 
-        if restarts >= MAX_RESTARTS:
-            print(f"[supervisor] лимит рестартов ({MAX_RESTARTS})", flush=True)
-            mark_permanently_failed(BOT_INDEX, code)
-            return
+            if code == 0:
+                print("[supervisor] l6 завершился штатно", flush=True)
+                mark_clean_exit(BOT_INDEX)
+                return
 
-        restarts += 1
-        print(f"[supervisor] l6 упал (код {code}), рестарт {restarts}/{MAX_RESTARTS}", flush=True)
-        mark_crashed(BOT_INDEX, code, will_restart=True)
+            if uptime >= RESTART_RESET_AFTER and restarts > 0:
+                print(f"[supervisor] uptime {uptime:.0f}s — сбрасываю счётчик", flush=True)
+                restarts = 0
 
-        if _stop.wait(timeout=SUPERVISOR_DELAY):
-            return
+            if restarts >= MAX_RESTARTS:
+                print(f"[supervisor] лимит рестартов ({MAX_RESTARTS})", flush=True)
+                mark_permanently_failed(BOT_INDEX, code)
+                return
+
+            restarts += 1
+            print(f"[supervisor] l6 упал (код {code}), рестарт {restarts}/{MAX_RESTARTS}", flush=True)
+            mark_crashed(BOT_INDEX, code, will_restart=True)
+
+            if _stop.wait(timeout=SUPERVISOR_DELAY):
+                return
+    finally:
+        _supervisor_lock.release()
 
 
 def _restart_bot():
@@ -256,19 +311,6 @@ def _restart_bot():
             proc.terminate()
         except OSError:
             pass
-
-
-# ============================================================
-# АВТОРИЗАЦИЯ
-# ============================================================
-def _check_token() -> bool:
-    if not ADMIN_TOKEN:
-        return False
-    if request.cookies.get("admin_token") == ADMIN_TOKEN:
-        return True
-    if request.args.get("token") == ADMIN_TOKEN:
-        return True
-    return False
 
 
 # ============================================================
@@ -284,7 +326,13 @@ def _read_prompt() -> str:
 def _build_admin_html() -> str:
     ui = _load_ui()
     l = ui["labels"]
-    sections = ui["sections"]
+    sections = dict(ui["sections"])  # копия, не мутируем дефолты
+
+    # Скрываем секции по правам текущей роли
+    if not _has_perm("prompt"):
+        sections["prompt"] = False
+    if not _has_perm("restart_bot") and not _has_perm("restart_all"):
+        sections["controls"] = False
 
     prompt_value = _read_prompt()
     prompt_escaped = (
@@ -293,7 +341,21 @@ def _build_admin_html() -> str:
         else "— пусто, бот использует встроенный дефолт —"
     )
 
-    # --- Блок управления ---
+    # Бейдж роли + выход
+    role = _get_role() or "?"
+    role_badge = f"""
+      <div style="background:var(--light-secondary);padding:10px 16px;border-radius:8px;
+                  margin-bottom:20px;font-size:0.9em;color:var(--gray);display:flex;
+                  justify-content:space-between;align-items:center;gap:12px;">
+        <span>Роль: <b style="color:var(--primary-color)">{html_escape.escape(role)}</b></span>
+        <button type="button"
+                onclick="fetch('/logout',{{method:'POST'}}).then(()=>location.reload())"
+                style="padding:6px 14px;border-radius:6px;border:none;background:var(--danger-color);color:white;cursor:pointer;font-weight:600;font-size:0.85em;">
+          🚪 Выйти
+        </button>
+      </div>
+    """
+
     parts = []
     if sections.get("controls"):
         parts.append(f"""
@@ -329,10 +391,11 @@ def _build_admin_html() -> str:
         """)
 
     admin_section = ""
-    if parts:
+    if parts or role_badge:
         admin_section = (
             '<section class="admin-section" '
             'style="margin-top:50px;padding-top:30px;border-top:2px solid var(--border-color);">'
+            + role_badge
             + "".join(parts)
             + '<script>async function adminPost(url){const r=await fetch(url,{method:"POST"});'
               'const j=await r.json();alert(JSON.stringify(j));}</script>'
@@ -342,7 +405,6 @@ def _build_admin_html() -> str:
     # --- Сборка из шаблона StayPresent ---
     html = STATUS_HTML_TEMPLATE
 
-    # Цвет/тема
     accent = ui["accent_color"]
     accent_dark = _hex_shift(accent, -16)
 
@@ -372,7 +434,6 @@ def _build_admin_html() -> str:
     html = html.replace("__STAYPRESENT_OG_TAGS_BLOCK__", "")
     html = html.replace("__STAYPRESENT_FAVICON_SCRIPT__", "")
 
-    # Футер
     if sections.get("footer"):
         copyright_text = (ui["footer"].get("copyright") or "").strip()
         copyright_block = f'<p>{html_escape.escape(copyright_text)}</p>' if copyright_text else ""
@@ -394,7 +455,6 @@ def _build_admin_html() -> str:
     html = html.replace("__STAYPRESENT_COPYRIGHT_BLOCK__", copyright_block)
     html = html.replace("__STAYPRESENT_FOOTER_LINKS_BLOCK__", links_block)
 
-    # Скрыть статус-панель целиком, если выключена
     if not sections.get("status"):
         hide_css = (
             "<style>"
@@ -408,7 +468,6 @@ def _build_admin_html() -> str:
         )
         html = html.replace("</head>", hide_css + "</head>")
 
-    # Наш блок управления — перед <footer>
     if admin_section:
         html = html.replace("      <footer>", admin_section + "\n      <footer>", 1)
 
@@ -423,9 +482,7 @@ def _login_page(err: str = "") -> str:
 
     if theme == "light":
         bg, card, line, text, muted, input_bg = "#f8fafc", "#ffffff", "#e2e8f0", "#0f172a", "#64748b", "#f1f5f9"
-    elif theme == "dark":
-        bg, card, line, text, muted, input_bg = "#0b1220", "#16202f", "#2d3b4e", "#e6edf3", "#94a3b8", "#0b1220"
-    else:  # auto
+    else:  # dark или auto
         bg, card, line, text, muted, input_bg = "#0b1220", "#16202f", "#2d3b4e", "#e6edf3", "#94a3b8", "#0b1220"
 
     e = f'<p style="color:#f87171;margin:0 0 1rem">{html_escape.escape(err)}</p>' if err else ""
@@ -464,15 +521,16 @@ def _login_page(err: str = "") -> str:
 def health():
     return jsonify({"status": "ok"})
 
+
 @app.route("/")
 def index():
-    if not ADMIN_TOKEN:
+    if not _load_admins():
         return Response(
             "<h1 style='font-family:sans-serif;text-align:center;margin-top:4rem'>"
-            "ADMIN_TOKEN не задан в env</h1>",
+            "Ни одного ADMIN_TOKEN_* не задано в env</h1>",
             status=503,
         )
-    if not _check_token():
+    if not _has_perm("view"):
         return Response(_login_page(), mimetype="text/html")
     return Response(_build_admin_html(), mimetype="text/html")
 
@@ -480,17 +538,28 @@ def index():
 @app.route("/login", methods=["POST"])
 def login():
     token = (request.form.get("token") or "").strip()
-    if token == ADMIN_TOKEN:
+    admins = _load_admins()
+    if token and token in admins:
         resp = Response(status=302)
         resp.headers["Location"] = "/"
-        resp.set_cookie("admin_token", ADMIN_TOKEN, httponly=True, samesite="Strict")
+        resp.set_cookie("admin_token", token, httponly=True, samesite="Strict")
         return resp
     return Response(_login_page("Неверный токен"), status=403, mimetype="text/html")
 
 
+@app.route("/logout", methods=["POST"])
+def logout():
+    resp = Response(status=302)
+    resp.headers["Location"] = "/"
+    resp.delete_cookie("admin_token")
+    return resp
+
+
 @app.route("/api/status.json")
 def api_status_json():
-    ui = _load_ui()
+    if not _has_perm("view"):
+        return jsonify({"error": "forbidden"}), 403
+
     timezone = "auto"
     time_format = "24h"
     try:
@@ -513,7 +582,7 @@ def api_status_json():
 
 @app.route("/prompt", methods=["POST"])
 def save_prompt():
-    if not _check_token():
+    if not _has_perm("prompt"):
         return Response("forbidden", status=403)
     text = (request.form.get("prompt") or "").strip()
     if text and not text.startswith("—"):
@@ -523,7 +592,7 @@ def save_prompt():
 
 @app.route("/restart-bot", methods=["POST"])
 def restart_bot_route():
-    if not _check_token():
+    if not _has_perm("restart_bot"):
         return jsonify({"error": "forbidden"}), 403
     _restart_bot()
     return jsonify({"status": "restarting l6"})
@@ -531,7 +600,7 @@ def restart_bot_route():
 
 @app.route("/restart-all", methods=["POST"])
 def restart_all_route():
-    if not _check_token():
+    if not _has_perm("restart_all"):
         return jsonify({"error": "forbidden"}), 403
     threading.Timer(1.0, lambda: os._exit(0)).start()
     return jsonify({"status": "dying"})
@@ -540,7 +609,23 @@ def restart_all_route():
 # ============================================================
 # ЗАПУСК
 # ============================================================
+def _shutdown(signum, frame):
+    print(f"[main] сигнал {signum}, останавливаюсь", flush=True)
+    _stop.set()
+    with _state_lock:
+        proc = current_proc
+    if proc is not None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
     registry_reset(
         [{"file": BOT_FILE, "module": None, "args": [], "env": {}, "status": None}],
         display_names=[BOT_NAME],

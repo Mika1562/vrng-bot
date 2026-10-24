@@ -34,7 +34,7 @@ if not DISCORD_TOKEN:
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("Model")
-TEMPERATURE = 0.7
+TEMPERATURE = os.getenv("Temp")
 REQUEST_TIMEOUT = 60.0
 DISCORD_LIMIT = 1900
 
